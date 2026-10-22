@@ -1,0 +1,15 @@
+[package]
+name = "faerbench"
+description = "Runs rustsolve on exported systems (bench/python/export_cases.py) and writes timings, residuals and solutions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = ["nd"]
+nd = ["rustsolve/nd"]
+
+[dependencies]
+rustsolve = { path = "../../crates/rustsolve" }

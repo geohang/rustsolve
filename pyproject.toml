@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rustsolve"
+description = "Sparse direct solves (Cholesky, LDL^T, LU) with a Rust core, permissively licensed."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "Hang Chen", email = "hchen117@uiowa.edu" }]
+dependencies = ["numpy>=1.21"]
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+]
+
+[project.optional-dependencies]
+scipy = ["scipy>=1.8"]
+test = ["pytest", "scipy>=1.8"]
+
+[project.urls]
+Repository = "https://github.com/geohang/rustsolve"
+
+[tool.maturin]
+manifest-path = "crates/rustsolve-py/Cargo.toml"
+python-source = "python"
+module-name = "rustsolve._rustsolve"

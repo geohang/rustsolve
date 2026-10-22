@@ -1,0 +1,1133 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 158687a..8666fa9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,3 +1,6 @@
++# Modified 2026 by Hang Chen for rustsolve
++# (https://github.com/geohang/rustsolve): option GIMLI_RUSTSOLVE links
++# rustsolve in place of UMFPACK and CHOLMOD.
+ cmake_minimum_required(VERSION 3.15)
+ 
+ if (POLICY CMP0025) # recognize appleclang
+@@ -587,8 +590,31 @@ endif()
+ #exit()
+ 
+ #find_or_build_package(CHOLMOD suitesparse)
+-find_package(UMFPACK REQUIRED)
+-find_package(CHOLMOD REQUIRED)
++# rustsolve (faer) replaces CHOLMOD and UMFPACK in LinSolver; see
++# https://github.com/geohang/rustsolve/tree/main/pgcore
++option(GIMLI_RUSTSOLVE "Solve LinSolver systems with rustsolve instead of CHOLMOD/UMFPACK" ON)
++if (GIMLI_RUSTSOLVE)
++    find_path(RUSTSOLVE_INCLUDE_DIR rustsolve.h
++              HINTS ${RUSTSOLVE_PREFIX}/include $ENV{RUSTSOLVE_PREFIX}/include)
++    find_library(RUSTSOLVE_LIBRARY NAMES rustsolve_capi
++                 HINTS ${RUSTSOLVE_PREFIX}/lib $ENV{RUSTSOLVE_PREFIX}/lib)
++    if (NOT RUSTSOLVE_INCLUDE_DIR OR NOT RUSTSOLVE_LIBRARY)
++        message(FATAL_ERROR "rustsolve not found: set RUSTSOLVE_PREFIX to a folder "
++                            "with include/rustsolve.h and lib/ (rustsolve_capi)")
++    endif()
++    message(STATUS "rustsolve: ${RUSTSOLVE_LIBRARY} (${RUSTSOLVE_INCLUDE_DIR})")
++    set(CHOLMOD_FOUND FALSE)
++    set(UMFPACK_FOUND FALSE)
++    # pg.core.versionStr() names the backend. GIMLI_VERSION gives the source
++    # version when the tree is not a git checkout (git archive, sdist).
++    if (GIMLI_VERSION)
++        set(LIBGIMLI_VERSION ${GIMLI_VERSION})
++    endif()
++    set(PACKAGE_VERSION \"${LIBGIMLI_VERSION}+rustsolve\")
++else()
++    find_package(UMFPACK REQUIRED)
++    find_package(CHOLMOD REQUIRED)
++endif()
+ 
+ if (NOT NOCPPUNIT)
+     find_package(CppUnit)
+diff --git a/core/src/CMakeLists.txt b/core/src/CMakeLists.txt
+index 8b6669c..2a6f12c 100644
+--- a/core/src/CMakeLists.txt
++++ b/core/src/CMakeLists.txt
+@@ -1,3 +1,6 @@
++# Modified 2026 by Hang Chen for rustsolve
++# (https://github.com/geohang/rustsolve): links rustsolve_capi when
++# GIMLI_RUSTSOLVE is on.
+ set(libgimli_TARGET_NAME gimli)
+ 
+ link_directories(${libgimli_BINARY_DIR})
+@@ -38,6 +41,11 @@ if (UMFPACK_FOUND)
+     target_link_libraries(${libgimli_TARGET_NAME} ${UMFPACK_LIBRARIES})
+ endif (UMFPACK_FOUND)
+ 
++if (GIMLI_RUSTSOLVE)
++    include_directories(${RUSTSOLVE_INCLUDE_DIR})
++    target_link_libraries(${libgimli_TARGET_NAME} ${RUSTSOLVE_LIBRARY})
++endif (GIMLI_RUSTSOLVE)
++
+ if (PYTHON_FOUND)
+     include_directories(${Python_INCLUDE_DIRS})
+ 
+diff --git a/core/src/bert/dcfemmodelling.cpp b/core/src/bert/dcfemmodelling.cpp
+index 85c45fa..26cef7e 100644
+--- a/core/src/bert/dcfemmodelling.cpp
++++ b/core/src/bert/dcfemmodelling.cpp
+@@ -16,7 +16,16 @@
+  *                                                                            *
+  ******************************************************************************/
+ 
++/*
++ * Modified 2026 by Hang Chen for rustsolve
++ * (https://github.com/geohang/rustsolve): the LinSolver made here is owned
++ * by a std::unique_ptr; with topography the primary potentials are the P2
++ * mesh's node values.
++ */
++
+ #include "dcfemmodelling.h"
++
++#include <memory>
+ #include "bertJacobian.h"
+ #include "bertMisc.h"
+ #include "bertDataContainer.h"
+@@ -1840,12 +1849,15 @@ void DCMultiElectrodeModelling::calculateK_(const std::vector < ElectrodeShape *
+     //** START solving
+     SolverWrapper * solver;
+     bool solverNeedsDelete = false;
++    // rustsolve: owns the LinSolver made below, also when an exception leaves
++    std::unique_ptr< SolverWrapper > solverOwner;
+     if (solver_ != nullptr){
+         solver = solver_;
+         solver->setMatrix(S_);
+     } else {
+         solver = new LinSolver(debug);
+         solverNeedsDelete = true;
++        solverOwner.reset(solver);
+         dynamic_cast< LinSolver * >(solver)->setMatrix(S_, 1);
+         if (debug) std::cout << "Factorize (" << solver->name() << ") matrix ... " << swatch.duration() << std::endl;
+     }
+@@ -1923,7 +1935,7 @@ void DCMultiElectrodeModelling::calculateK_(const std::vector < ElectrodeShape *
+     // we dont need reserve the memory
+     S_.clean();
+     if (solverNeedsDelete == true){
+-        delete solver;
++        solverOwner.reset();
+     }
+ }
+ 
+@@ -2013,6 +2025,9 @@ void DCSRMultiElectrodeModelling::checkPrimpotentials_(const std::vector < Elect
+                             << std::endl;
+                 }
+ 
++                // rustsolve: a P2 mesh made here starts with the forward mesh's
++                // nodes, and its values there are taken below
++                bool primMeshMadeHere = !primMesh_;
+                 if (!primMesh_){
+                     primMesh_ = new Mesh;
+ // dangerous can lead to extremly large meshes
+@@ -2041,7 +2056,38 @@ void DCSRMultiElectrodeModelling::checkPrimpotentials_(const std::vector < Elect
+ //                     primMesh_->addData("p"+str(i), log(abs(primPotentials[i])));
+ //                 }
+ 
+-                interpolate(*primMesh_, primPotentials, mesh_->positions(), *primPot_, verbose_);
++                if (primMeshMadeHere){
++                    // rustsolve: node j of the forward mesh is node j of the P2
++                    // mesh (Mesh::createRefined_), so take its value instead of
++                    // interpolating it: interpolate() takes the first cell around
++                    // a node in heap-address order, and where the shape functions
++                    // are 0 and 1 only to rounding (fused multiply-adds on macOS
++                    // arm64) the value changed from one process to the next
++                    Index n = mesh_->nodeCount();
++                    if (primMesh_->nodeCount() < n){
++                        throwError(WHERE_AM_I + " the P2 mesh has fewer nodes than the forward mesh.");
++                    }
++                    for (Index j = 0; j < n; j ++){
++                        if (primMesh_->node(j).pos() != mesh_->node(j).pos()){
++                            throwError(WHERE_AM_I + " node " + str(j) + " of the P2 mesh is not "
++                                       "the forward mesh's node " + str(j) + ".");
++                        }
++                    }
++                    if (primPot_->rows() != primPotentials.rows()){
++                        primPot_->resize(primPotentials.rows(), n);
++                    }
++                    for (Index i = 0; i < primPotentials.rows(); i ++){
++                        if (primPotentials[i].size() == 0) continue;
++                        if (primPotentials[i].size() != primMesh_->nodeCount()){
++                            throwLengthError(WHERE_AM_I + " primary potential " + str(i) + " has "
++                                             + str(primPotentials[i].size()) + " values, the P2 mesh "
++                                             + str(primMesh_->nodeCount()) + " nodes.");
++                        }
++                        for (Index j = 0; j < n; j ++) (*primPot_)[i][j] = primPotentials[i][j];
++                    }
++                } else {
++                    interpolate(*primMesh_, primPotentials, mesh_->positions(), *primPot_, verbose_);
++                }
+                 primPot_->rowFlag().fill(1);
+ 
+ //                 for (Index i = 0; i < primPot_->rows(); i ++ ){
+@@ -2198,6 +2244,8 @@ void DCSRMultiElectrodeModelling::calculateK(const std::vector < ElectrodeShape
+ // MEMINFO
+     SolverWrapper *solver;
+     bool solverNeedsDelete = false;
++    // rustsolve: owns the LinSolver made below, also when an exception leaves
++    std::unique_ptr< SolverWrapper > solverOwner;
+ 
+     if (solver_ != nullptr){
+         solver = solver_;
+@@ -2205,6 +2253,7 @@ void DCSRMultiElectrodeModelling::calculateK(const std::vector < ElectrodeShape
+     } else {
+         solver = new LinSolver(debug);
+         solverNeedsDelete = true;
++        solverOwner.reset(solver);
+         dynamic_cast< LinSolver * >(solver)->setMatrix(S_, 1);
+         if (debug) std::cout << "Factorize (" << solver->name() << ") matrix ... " << swatch.duration() << std::endl;
+     }
+@@ -2290,7 +2339,7 @@ void DCSRMultiElectrodeModelling::calculateK(const std::vector < ElectrodeShape
+     }
+ 
+     if (solverNeedsDelete == true){
+-        delete solver;
++        solverOwner.reset();
+     }
+ 
+ }
+diff --git a/core/src/cholmodWrapper.cpp b/core/src/cholmodWrapper.cpp
+index b240807..f75682a 100644
+--- a/core/src/cholmodWrapper.cpp
++++ b/core/src/cholmodWrapper.cpp
+@@ -16,64 +16,177 @@
+  *                                                                            *
+  ******************************************************************************/
+ 
++/*
++ * Modified 2026 by Hang Chen for rustsolve
++ * (https://github.com/geohang/rustsolve): the CHOLMOD/UMFPACK calls are
++ * replaced by the rustsolve C ABI (faer). The class declaration in
++ * cholmodWrapper.h only gains overrides of SolverWrapper's two
++ * setMatrix(const ...&) overloads, so the layout and the exported symbols the
++ * Python bindings use stay the same.
++ *
++ * Behaviour kept from the original:
++ *  - real symmetric matrices: Cholesky (was CHOLMOD), from one triangle;
++ *    a matrix stored as one triangle (S.stype() != 0) is read from that
++ *    triangle, the other entries ignored, as CHOLMOD did;
++ *  - the symmetry test (absolute 1e-12); a full-storage matrix that fails
++ *    it, or forceUmfpack / BERTUSEUMFPACK=1: LU (was UMFPACK).
++ * Behaviour changed on purpose:
++ *  - every failure throws (the original ignored CHOLMOD/UMFPACK status and
++ *    returned whatever the solve produced), and a matrix that is refused
++ *    leaves the wrapper without a factor, so a later solve throws too;
++ *  - LU of a matrix stored as one triangle works on the full symmetric
++ *    matrix (UMFPACK factorized the triangle alone);
++ *  - stype 0 no longer means CHOLMOD's normal equations (A*A'): symmetric
++ *    matrices that are not positive definite are refused (docs/design.md,
++ *    open questions);
++ *  - one rustsolve handle per wrapper; a new matrix with the same pattern is
++ *    only refactorized, and handles share the analysis of an identical pattern
++ *    (pgcore builds a new LinSolver for every wavenumber);
++ *  - complex matrices are refused; rustsolve does not take over UMFPACK's
++ *    complex path (docs/design.md, open questions);
++ *  - the storage comes from the matrix itself (S.stype()); the stype given to
++ *    the constructor is not used. The original passed it to CHOLMOD, where it
++ *    chose the triangle of a full matrix, or the normal equations (0).
++ */
++
+ #include "cholmodWrapper.h"
+ #include "vector.h"
+ #include "sparsematrix.h"
+ 
+-#if CHOLMOD_FOUND
+-    #define CHOLMOD_MAXMETHODS 9
+-    #define UF_long long
+-
+-    #include <cholmod.h>
+-    #define USE_CHOLMOD 1
++#include <rustsolve.h>
+ 
+-    #if defined(UMFPACK_FOUND)
+-        #if (UMFPACK_FOUND == TRUE)
+-            #include <umfpack.h>
+-            #define USE_UMFPACK 1
+-        #endif
+-    #endif
+-#endif
++#include <algorithm>
++#include <climits>
++#include <cstdlib>
++#include <string>
++#include <utility>
++#include <vector>
+ 
+ namespace GIMLI{
+ 
+-#if USE_CHOLMOD
+-    bool CHOLMODWrapper::valid() { return true; }
+-#else
+-    bool CHOLMODWrapper::valid() { return false; }
+-#endif
++namespace {
++
++rs_solver * handle_(void * p){ return static_cast< rs_solver * >(p); }
++
++std::string envString_(const char * name){
++    const char * v = std::getenv(name);
++    return v ? std::string(v) : std::string();
++}
++
++void check_(rs_solver * s, int32_t status, const std::string & what){
++    if (status != RS_OK){
++        throwError(WHERE_AM_I + " rustsolve " + what + " failed ("
++                   + rs_status_name(status) + "): "
++                   + (s ? rs_last_error(s) : ""));
++    }
++}
++
++/*! The compressed-row arrays of S describe an n x n matrix: pointer and value
++ * counts, increasing pointers, column indices in range. pgcore's constructor
++ * from arrays does not check them, and the triangle conversions below index
++ * with them before rustsolve sees them. */
++void checkArrays_(RSparseMatrix & S){
++    const std::vector < int > & cp = S.vecColPtr();
++    const std::vector < int > & ri = S.vecRowIdx();
++    Index n = S.rows();
++    bool ok = cp.size() == n + 1 && cp[0] == 0 && cp[n] >= 0
++        && (size_t)cp[n] == ri.size() && ri.size() == S.vecVals().size();
++    for (Index i = 0; ok && i < n; i ++) ok = cp[i] <= cp[i + 1];
++    for (size_t k = 0; ok && k < ri.size(); k ++) ok = ri[k] >= 0 && (Index)ri[k] < n;
++    if (!ok) throwError(WHERE_AM_I + " inconsistent sparse matrix arrays.");
++    // pgcore's rowIdx() and vals() take &v[0], which an empty array does not have
++    if (ri.empty()) throwError(WHERE_AM_I + " the matrix has no entries.");
++}
++
++/*! Transpose of compressed-row arrays, as compressed rows. */
++void transpose_(Index n, const std::vector < int > & cp,
++                const std::vector < int > & ri, const RVector & v,
++                std::vector < int > & tp, std::vector < int > & ti,
++                std::vector < double > & tv){
++    tp.assign(n + 1, 0);
++    ti.resize(ri.size());
++    tv.resize(ri.size());
++    for (size_t k = 0; k < ri.size(); k ++) tp[ri[k] + 1] ++;
++    for (Index i = 0; i < n; i ++) tp[i + 1] += tp[i];
++    std::vector < int > next(tp.begin(), tp.end() - 1);
++    for (Index i = 0; i < n; i ++){
++        for (int k = cp[i]; k < cp[i + 1]; k ++){
++            int d = next[ri[k]] ++;
++            ti[d] = i;
++            tv[d] = v[k];
++        }
++    }
++}
++
++/*! Full symmetric storage, as compressed rows, of a matrix stored as one
++ * triangle: stype < 0 keeps columns j >= i of each row i, stype > 0 keeps
++ * j <= i (pgcore's SparseMapMatrix convention); entries of the other triangle
++ * are ignored, as CHOLMOD ignored them. */
++void fullFromTriangle_(Index n, int stype, const std::vector < int > & cp,
++                       const std::vector < int > & ri, const RVector & v,
++                       std::vector < int > & fp, std::vector < int > & fi,
++                       std::vector < double > & fv){
++    std::vector < std::vector < std::pair < int, double > > > rows(n);
++    for (Index i = 0; i < n; i ++){
++        for (int k = cp[i]; k < cp[i + 1]; k ++){
++            int j = ri[k];
++            if (stype < 0 ? j < (int)i : j > (int)i) continue;
++            rows[i].push_back(std::make_pair(j, v[k]));
++            if (j != (int)i) rows[j].push_back(std::make_pair((int)i, v[k]));
++        }
++    }
++    size_t total = 0;
++    for (Index i = 0; i < n; i ++) total += rows[i].size();
++    if (total > (size_t)INT_MAX){
++        throwError(WHERE_AM_I + " the full matrix has too many entries for 32-bit indices.");
++    }
++    fp.assign(n + 1, 0);
++    fi.clear();
++    fv.clear();
++    for (Index i = 0; i < n; i ++){
++        std::sort(rows[i].begin(), rows[i].end());
++        for (size_t k = 0; k < rows[i].size(); k ++){
++            fi.push_back(rows[i][k].first);
++            fv.push_back(rows[i][k].second);
++        }
++        fp[i + 1] = (int)fi.size();
++    }
++}
++
++/*! Exact symmetry of a CRS matrix (both triangles stored), as the original
++ * test with an absolute tolerance of 1e-12. */
++bool isSymmetric_(RSparseMatrix & S){
++    const std::vector < int > & cp = S.vecColPtr();
++    const std::vector < int > & ri = S.vecRowIdx();
++    const RVector & v = S.vecVals();
++    for (Index i = 0; i < S.rows(); i ++){
++        for (int j = cp[i]; j < cp[i + 1]; j ++){
++            if (v[j] != 0.0){
++                if (::fabs(v[j] - S.getVal(ri[j], i, false)) > 1e-12) return false;
++            }
++        }
++    }
++    return true;
++}
++
++} // namespace
++
++bool CHOLMODWrapper::valid() { return true; }
++
++// setMatrix releases the handle when it throws, so a constructor that throws
++// (and runs no destructor) leaks nothing
+ 
+ CHOLMODWrapper::CHOLMODWrapper(RSparseMatrix & S, bool verbose, int stype,
+                                bool forceUmfpack)
+     : SolverWrapper(verbose), stype_(stype), forceUmfpack_(forceUmfpack){
+-    
+-    Numeric_ = nullptr;
+-    NumericD_= nullptr;
+-    c_ = NULL;
+-    A_ = NULL;
+-    L_ = NULL;
+-    AxV_ = NULL;
+-    AzV_ = NULL;
+-    Ap_ = NULL;
+-    Ai_ = NULL;
+-    ApR_ = NULL;
+-    AiR_ = NULL;
++    init();
+     setMatrix(S);
+ }
++
+ CHOLMODWrapper::CHOLMODWrapper(CSparseMatrix & S, bool verbose, int stype,
+                                bool forceUmfpack)
+     : SolverWrapper(verbose), stype_(stype), forceUmfpack_(forceUmfpack){
+-    Numeric_ = nullptr;
+-    NumericD_= nullptr;
+-    c_ = NULL;
+-    A_ = NULL;
+-    L_ = NULL;
+-    AxV_ = NULL;
+-    AzV_ = NULL;
+-    Ap_ = NULL;
+-    Ai_ = NULL;
+-    ApR_ = NULL;
+-    AiR_ = NULL;
++    init();
+     setMatrix(S);
+ }
+ 
+@@ -81,415 +194,172 @@ CHOLMODWrapper::~CHOLMODWrapper(){
+     this->free();
+ }
+ 
+-void CHOLMODWrapper::free(){
+-#if USE_CHOLMOD
+-    if (L_) cholmod_free_factor((cholmod_factor**)(&L_), (cholmod_common*)c_);
+-//     ** We did not allocate the matrix so we dont need to free it
+-//      cholmod_free_sparse(&A_, c_);
+-
+-    cholmod_finish((cholmod_common*)c_);
+-
+-    if (A_) delete (cholmod_sparse*)A_;
+-    A_ = nullptr;
+-    if (c_) delete (cholmod_common*)c_;
++void CHOLMODWrapper::init(){
++    // c_ holds the rustsolve handle; the other members of the original layout
++    // stay unused
+     c_ = nullptr;
+-
+-#if USE_UMFPACK
+-    if (Numeric_) umfpack_zi_free_numeric (&Numeric_);
++    A_ = nullptr;
++    L_ = nullptr;
+     Numeric_ = nullptr;
+-    if (NumericD_) umfpack_di_free_numeric (&NumericD_);
+     NumericD_ = nullptr;
+-#endif
+-    // try allways
+-    if (AxV_) delete AxV_;
+-    AxV_ = nullptr;
+-    if (AzV_) delete AzV_;
+-    AzV_ = nullptr;
+-
+-    if (ApR_) delete [] ApR_;
++    Ap_ = nullptr;
++    Ai_ = nullptr;
+     ApR_ = nullptr;
+-
+-    if (AiR_) delete [] AiR_;
+     AiR_ = nullptr;
++    AxV_ = nullptr;
++    AzV_ = nullptr;
++    useUmfpack_ = false;
++    dummy_ = false;
++    name_ = "rustsolve";
++}
+ 
+-#else
+-    std::cerr << WHERE_AM_I << " cholmod not installed" << std::endl;
+-#endif
++void CHOLMODWrapper::free(){
++    if (c_) rs_free(handle_(c_));
++    c_ = nullptr;
+ }
+ 
+ void CHOLMODWrapper::setMatrix(RSparseMatrix & S){
+-    this->free();
+     init_(S, stype_);
+ }
++
++// SolverWrapper's overloads (declared by apply_rustsolve.py); S is only read
++void CHOLMODWrapper::setMatrix(const RSparseMatrix & S){
++    setMatrix(const_cast< RSparseMatrix & >(S));
++}
++
++void CHOLMODWrapper::setMatrix(const CSparseMatrix & S){
++    setMatrix(const_cast< CSparseMatrix & >(S));
++}
++
+ void CHOLMODWrapper::setMatrix(CSparseMatrix & S){
++    // refused: the previous real factor must not stay usable
+     this->free();
+-    init_(S, stype_);
++    throwError(WHERE_AM_I + " complex matrices are not supported by the "
++               "rustsolve backend of this pgcore build.");
+ }
+ 
+ template < class ValueType >
+ void CHOLMODWrapper::init_(SparseMatrix < ValueType > & S, int stype){
+-
+-    dim_ = S.size();
+-    nVals_ = S.nVals();
+-
+-    useUmfpack_ = false;
+-    Numeric_ = 0;
+-    NumericD_ = 0;
+-    c_ = NULL;
+-    A_ = NULL;
+-    L_ = NULL;
+-    AxV_ = NULL;
+-    AzV_ = NULL;
+-    Ap_ = NULL;
+-    Ai_ = NULL;
+-    ApR_ = NULL;
+-    AiR_ = NULL;
+-
+-    if (stype == -2){
+-        stype_ = S.stype();
+-    } else {
+-        stype_ = stype;
+-    }
+-
+-#if USE_CHOLMOD
+-    int ret = 0;
+-    c_ = new cholmod_common;
+-    ret =  cholmod_start((cholmod_common*)c_);
+-    if (ret) dummy_ = false;
+     initializeMatrix_(S);
+-#elif USE_UMFPACK
+-    initializeMatrix_(S);
+-#else
+-    std::cerr << WHERE_AM_I << " cholmod not installed" << std::endl;
+-#endif
+ }
+ 
+ int CHOLMODWrapper::initializeMatrix_(CSparseMatrix & S){
+-
+-    if (!dummy_){
+-        // check for non-hermetian
+-        if (S.stype() == 0){ //  matrix is full
+-            for (Index i = 0; i < S.size(); i++){
+-                for (int j = S.vecColPtr()[i]; j < S.vecColPtr()[i + 1]; j ++){
+-                    if (std::imag(S.vecVals()[j]) != 0.0){
+-                        if (S.vecVals()[j] == S.getVal(S.vecRowIdx()[j], i)){
+-                            // non-hermetian symmetric
+-                            // if (verbose_) std::cout << "non-hermetian symmetric "
+-                            // " matrix found .. switching to umfpack." << std::endl;
+-                            useUmfpack_ = true;
+-                            i = S.size();
+-                            break;
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        if (forceUmfpack_) useUmfpack_ = true;
+-
+-        if (useUmfpack_){
+-#if USE_UMFPACK
+-// __MS("new C")
+-            Ap_ = (int*)S.colPtr();
+-            Ai_ = (int*)S.rowIdx();
+-            AxV_ = new RVector(real(S.vecVals()));
+-            AzV_ = new RVector(imag(S.vecVals()));
+-            double * Ax_ = &((*AxV_)[0]);
+-            double * Az_ = &((*AzV_)[0]);
+-
+-            double *null = (double *) NULL;
+-            void *Symbolic;
+-
+-            // if (verbose_) std::cout << "Using umfpack .. " << std::endl;
+-
+-            umfpack_zi_symbolic (S.nRows(), S.nRows(), Ap_, Ai_, Ax_, Az_, &Symbolic, null, null) ;
+-            umfpack_zi_numeric (Ap_, Ai_, Ax_, Az_, Symbolic, &Numeric_, null, null) ;
+-            umfpack_zi_free_symbolic (&Symbolic);
+-            name_ = "Umfpack";
+-            return 1;
+-#else
+-            std::cerr << WHERE_AM_I << " umfpack not installed" << std::endl;
+-#endif
+-        } else {
+-#if USE_CHOLMOD
+-            name_ = "Cholmod";
+-            return initMatrixChol_(S, CHOLMOD_COMPLEX);
+-#endif
+-			return 0;
+-        }
+-    } // if ! dummy
++    this->free();
++    throwError(WHERE_AM_I + " complex matrices are not supported by the "
++               "rustsolve backend of this pgcore build.");
+     return 0;
+ }
+ 
+ int CHOLMODWrapper::initializeMatrix_(RSparseMatrix & S){
+-    if (!dummy_){
+-        // check symmetry
+-        if (S.stype() == 0){ //  matrix is full
+-            for (Index i = 0; i < S.size(); i++){
+-                for (int j = S.vecColPtr()[i]; j < S.vecColPtr()[i + 1]; j ++){
+-//                     __MS(i << " " << j << " " << S.vecColPtr()[i] << " " << S.vecColPtr()[i + 1] << " " << S.vecRowIdx()[j])
+-                    if (S.vecVals()[j] != 0.0){
+-//                 __MS(S.vecVals()[j] << " "  << S.getVal(S.vecRowIdx()[j], i))
+-                        if (::fabs(S.vecVals()[j] - S.getVal(S.vecRowIdx()[j], i, false)) > 1e-12){
+-                            // non-symmetric
+-                            if (verbose_) {
+-                                log(Info,
+-                                    "non-symmetric matrix found (", i,
+-                                    S.vecRowIdx()[j],
+-                                    S.vecVals()[j] , " ",
+-                                    S.getVal(S.vecRowIdx()[j], i), "tol:",
+-                                    ::fabs(S.vecVals()[j] - S.getVal(S.vecRowIdx()[j], i, false)),
+-                                    ").. switching to umfpack." );
+-                            }
+-                            useUmfpack_ = true;
+-                            i = S.size();
+-                            break;
+-                        }
+-                        //i = S.size();
+-                        //break;
+-                    }
+-                }
+-            }
++    // a matrix that is refused, here or by rustsolve, leaves no handle: a later
++    // solve throws instead of using the previous matrix's factor
++    try {
++        dim_ = S.size();
++        nVals_ = S.nVals();
++        if (S.rows() != S.cols()){
++            throwError(WHERE_AM_I + " matrix is not square: "
++                       + str(S.rows()) + " x " + str(S.cols()));
+         }
+-        
+-        if (forceUmfpack_ || getEnvironment("BERTUSEUMFPACK", 0) == 1) useUmfpack_ = true;
+-
+-        if (useUmfpack_){
+-#if USE_UMFPACK
+-
+-            log(Info, "Using umfpack.");
+-            int * ApT = (int*)S.colPtr();
+-            int * AiT = (int*)S.rowIdx();
+-            double * AxT = &S.vecVals()[0];
+-
+-            AxV_ = new RVector(S.vecVals());
+-
+-            double * null = (double *) NULL;
+-
+-            ApR_ = new int[S.vecColPtr().size()];
+-            AiR_ = new int[S.vecRowIdx().size()];
+-            double *Ax_ =  new double[S.vecVals().size()]; // delete me!!
+-            //our crs format need to be transposed first
+-
+-            int *P=0, *Q=0;
+-            (void) umfpack_di_transpose(S.nRows(), S.nCols(), ApT, AiT, AxT, P, Q, ApR_, AiR_, Ax_);
+-
+-            for (uint i = 0; i < S.vecVals().size(); i++) (*AxV_)[i] = Ax_[i];
++        if (S.rows() == 0) throwError(WHERE_AM_I + " empty matrix.");
++        checkArrays_(S);
++
++        // the same choice the original made between CHOLMOD and UMFPACK
++        int stype = S.stype();
++        bool lu = forceUmfpack_ || getEnvironment("BERTUSEUMFPACK", 0) == 1;
++        if (!lu && stype == 0 && !isSymmetric_(S)){
++            if (verbose_) log(Info, "non-symmetric matrix found .. switching to LU.");
++            lu = true;
++        }
++        int kind = lu ? RS_KIND_LU : RS_KIND_LLT;
+ 
+-            void *Symbolic;
++        // a different kind needs a new handle
++        if (c_ && useUmfpack_ != lu) this->free();
++        useUmfpack_ = lu;
+ 
+-            // if (verbose_) std::cout << "Using umfpack .. " << std::endl;
+-            // beware transposed matrix here
+-            Stopwatch sw;
+-            // __MS(sw.duration(true))
+-            (void) umfpack_di_symbolic(S.nCols(), S.nRows(), ApR_, AiR_, Ax_, &Symbolic, null, null) ;
+-            // __MS(sw.duration(true)) // test maybe just 1% ??
+-            (void) umfpack_di_numeric(ApR_, AiR_, Ax_, Symbolic, &NumericD_, null, null) ;
+-            // __MS(sw.duration(true))
+-            umfpack_di_free_symbolic(&Symbolic);
+-            // __MS(sw.duration(true))
+-            name_ = "Umfpack";
++        if (!c_){
++            if (rs_abi_version() != RS_ABI_VERSION){
++                throwError(WHERE_AM_I + " rustsolve library has C ABI "
++                           + str(rs_abi_version()) + ", this build expects "
++                           + str(RS_ABI_VERSION) + ".");
++            }
++            rs_options o;
++            rs_default_options(&o);
++            o.kind = kind;
++            // pgcore stores compressed rows
++            o.compressed_rows = 1;
++            o.share_analysis = 1;
++            // symmetry is decided above with the original's test (absolute 1e-12),
++            // and a matrix that fails it goes to LU. rustsolve's own test is
++            // relative and would refuse matrices the original factorized: the
++            // Cholesky reads one triangle, as CHOLMOD did.
++            o.check_symmetry = 0;
++            // for experiments; the thread and ordering policy is an open
++            // question (docs/design.md)
++            std::string t = envString_("RUSTSOLVE_THREADS");
++            if (!t.empty()) o.threads = std::atoi(t.c_str());
++            if (envString_("RUSTSOLVE_ORDERING") == "nd") o.ordering = RS_ORDERING_ND;
++
++            rs_solver * s = nullptr;
++            check_(nullptr, rs_new(&o, &s), "init");
++            c_ = s;
++        }
+ 
+-            return 1;
+-#else
+-            std::cerr << WHERE_AM_I << " umfpack not installed" << std::endl;
+-#endif
++        // With compressed rows the Cholesky reads the upper triangle of each row
++        // (columns j >= i), the lower triangle of the column view. pgcore stores
++        // stype < 0 as exactly that triangle, stype > 0 as the other one.
++        Index n = S.rows();
++        if (stype == 0 || (!lu && stype < 0)){
++            check_(handle_(c_), rs_update_i32(handle_(c_), n, S.colPtr(),
++                                              S.rowIdx(), S.vals()),
++                   "factorization");
+         } else {
+-#if USE_CHOLMOD
+-            name_ = "Cholmod";
+-            return initMatrixChol_(S, CHOLMOD_REAL);
+-#endif
++            std::vector < int > tp, ti;
++            std::vector < double > tv;
++            if (lu){
++                // LU needs both triangles
++                fullFromTriangle_(n, stype, S.vecColPtr(), S.vecRowIdx(),
++                                  S.vecVals(), tp, ti, tv);
++            } else {
++                transpose_(n, S.vecColPtr(), S.vecRowIdx(), S.vecVals(), tp, ti, tv);
++            }
++            check_(handle_(c_), rs_update_i32(handle_(c_), n, tp.data(), ti.data(),
++                                              tv.data()),
++                   "factorization");
+         }
+-        return 0;
+-    } // if ! dummy
+-    return 0;
+-}
+ 
+-template < class ValueType >
+-int CHOLMODWrapper::initMatrixChol_(SparseMatrix < ValueType > & S, int xType){
+-    if (!dummy_){
+-#if USE_CHOLMOD
+-
+-        A_ = new cholmod_sparse;
+-        ((cholmod_sparse*)A_)->nrow  = S.nRows();           /* number of rows */
+-        ((cholmod_sparse*)A_)->ncol  = S.nCols();           /* number of columns */
+-        ((cholmod_sparse*)A_)->nzmax = S.nVals();           /* maximum number of entries */
+-        ((cholmod_sparse*)A_)->p     = (void*)S.colPtr();   /* column pointers (size n+1) or col indices (size nzmax) */
+-        ((cholmod_sparse*)A_)->i     = (void*)S.rowIdx();   /* row indices, size nzmax */
+-
+-        ((cholmod_sparse*)A_)->x     = S.vals();     /* numerical values, size nzmax */
+-        ((cholmod_sparse*)A_)->stype = stype_;
+-
+-        ((cholmod_sparse*)A_)->itype = CHOLMOD_INT;
+-        ((cholmod_sparse*)A_)->xtype = xType;  // data type for the pattern (Real, complex, zcomplex)
+-        ((cholmod_sparse*)A_)->dtype = CHOLMOD_DOUBLE; // data type for complex or real (float/double)
+-        ((cholmod_sparse*)A_)->packed = true;
+-        ((cholmod_sparse*)A_)->sorted = true; // testen, scheint schneller, aber hab ich das immer?
+-
+-        factorise_();
+-#else
+-        std::cerr << WHERE_AM_I << " cholmod not installed" << std::endl;
+-#endif
+-    } // if ! dummy
+-    return 0;
++        if (verbose_){
++            rs_info info;
++            rs_get_info(handle_(c_), &info);
++            log(Info, "rustsolve " + std::string(lu ? "LU" : "LLT")
++                      + ": n=" + str(info.n) + " nnz(A)=" + str(info.nnz_a)
++                      + " nnz(L)=" + str(info.nnz_factor)
++                      + (info.supernodal ? " supernodal" : " simplicial")
++                      + (info.reanalyzed ? (info.analysis_shared ? " analysis shared"
++                                                                 : " analyzed")
++                                         : " refactorized"));
++        }
++        return 1;
++    } catch (...) {
++        this->free();
++        throw;
++    }
+ }
+ 
+ int CHOLMODWrapper::factorise_(){
+-    if (!dummy_){
+-#if USE_CHOLMOD
+-         if (useUmfpack_){
+-             // allready factorized in matrix init;
+-             //std::cerr << WHERE_AM_I << " factorize for umfpack called" << std::endl;
+-         } else {
+-            if (verbose_) cholmod_print_sparse((cholmod_sparse *)A_, "A", (cholmod_common*)c_);
+-            // cholmod_print_common("common parameter", (cholmod_common*)c_);
+-
+-
+-            // CHOLMOD_SIMPLICIA == 0
+-            // CHOLMOD_AUTO == 1
+-            // CHOLMOD_SUPERNODAL == 2
+-            // __MS(((cholmod_common *)c_)->supernodal)
+-            // ((cholmod_common *)c_)->supernodal=1;
+-
+-            // __MS(((cholmod_common *)c_)->nmethods)
+-            // ((cholmod_common *)c_)->nmethods=0;
+-            // ((cholmod_common *)c_)->current=3;
+-
+-
+-            L_ = cholmod_analyze((cholmod_sparse*)A_,
+-                                 (cholmod_common*)c_);		    /* analyze */
+-            // __MS(((cholmod_factor *)L_)->is_super)
+-            cholmod_factorize((cholmod_sparse*)A_,
+-                              (cholmod_factor*)L_,
+-                              (cholmod_common*)c_);		    /* factorize */
+-
+-        if (verbose_) std::cout << "CHOLMOD analyzed preordering: "
+-                                << ((cholmod_factor *)(L_))->ordering << std::endl;
+-
+-        if (verbose_) cholmod_print_factor((cholmod_factor *)L_, "L", (cholmod_common*)c_);
+-    }
++    // factorization happens in initializeMatrix_
+     return 1;
+-#else
+-        std::cerr << WHERE_AM_I << " cholmod not installed" << std::endl;
+-#endif
+-    }
+-    return 0;
+-}
+-
+-template < class ValueType >
+-    void CHOLMODWrapper::solveCHOL_(const Vector < ValueType > & rhs,
+-                                   Vector < ValueType > & solution){
+-    ASSERT_VEC_SIZE(rhs, this->dim_)
+-    ASSERT_VEC_SIZE(solution, this->dim_)
+-    if (!dummy_){
+-#if USE_CHOLMOD
+-        cholmod_dense * b = cholmod_zeros(((cholmod_sparse*)A_)->nrow,
+-                                         1,
+-                                         ((cholmod_sparse*)A_)->xtype,
+-                                         (cholmod_common*)c_);
+-        cholmod_dense * r = cholmod_zeros(((cholmod_sparse*)A_)->nrow,
+-                                          1,
+-                                          ((cholmod_sparse*)A_)->xtype,
+-                                          (cholmod_common*)c_);
+-
+-        ValueType * bx = (ValueType*)b->x;
+-        for (uint i = 0; i < dim_; i++) bx[i] = rhs[i];
+-
+-        cholmod_dense * x = cholmod_solve(CHOLMOD_A,
+-                                          (cholmod_factor *)L_,
+-                                          b,
+-                                          (cholmod_common *)c_);       /* solve Ax=b */
+-
+-        if (((cholmod_sparse*)A_)->stype == 0){
+-            double al[2] = {0,0}, be[2] = {1,0};       /* basic scalars */
+-            cholmod_sdmult((cholmod_sparse*)A_, 0, be, al, x, r, (cholmod_common*)c_);
+-            bx = (ValueType *)r->x; /* ret = Ax */
+-            for (uint i = 0; i < dim_; i++) solution[i] = conj(bx[i]);
+-
+-            //conj here .. check crs->ccs format or transpose before use
+-
+-        } else {
+-            bx = (ValueType *)x->x; /* ret = x */
+-            for (uint i = 0; i < dim_; i++) solution[i] = bx[i];
+-        }
+-        cholmod_free_dense(&x, (cholmod_common*)c_);
+-        cholmod_free_dense(&r, (cholmod_common*)c_);
+-        cholmod_free_dense(&b, (cholmod_common*)c_);
+-#else
+-    std::cerr << WHERE_AM_I << " cholmod not installed" << std::endl;
+-#endif
+-    }
+ }
+ 
+ void CHOLMODWrapper::solve(const RVector & rhs, RVector & solution){
++    if (!c_) throwError(WHERE_AM_I + " no matrix set, or the last one was refused.");
+     ASSERT_VEC_SIZE(rhs, this->dim_)
+-    ASSERT_VEC_SIZE(solution, this->dim_)
+-    if (!dummy_){
+-
+-        if (useUmfpack_){
+-#if USE_UMFPACK
+-            double * Ax_ = &((*AxV_)[0]);
+-
+-            double *null = (double *) NULL ;
+-
+-            (void) umfpack_di_solve(UMFPACK_A, ApR_, AiR_, Ax_,
+-                                    &solution[0], &rhs[0],
+-                                    NumericD_, null, null) ;
+-
+-
+-// int Ap [ ] = {0, 2, 5, 9, 10, 12} ;
+-// int Ai [ ] = { 0, 1, 0, 2, 4, 1, 2, 3, 4, 2, 1, 4} ;
+-// double Ax [ ] = {2., 3., 3., -1., 4., 4., -3., 1., 2., 2., 6., 1.} ;
+-// // double b [ ] = {8., 45., -3., 3., 19.} ;
+-//
+-// void *Symbolic, *Numeric ;
+-// (void) umfpack_di_symbolic (n, n, Ap, Ai, Ax, &Symbolic, null, null) ;
+-// (void) umfpack_di_numeric (Ap, Ai, Ax, Symbolic, &Numeric, null, null) ;
+-// umfpack_di_free_symbolic (&Symbolic) ;
+-//
+-// (void) umfpack_di_solve (UMFPACK_A, Ap, Ai, Ax, &solution[0], &rhs[0], Numeric, null, null) ;
+-// umfpack_di_free_numeric (&Numeric) ;
+-//
+-
+-#endif
+-        } else {
+-            return solveCHOL_(rhs, solution);
+-        }
+-    }
++    solution = rhs;
++    check_(handle_(c_), rs_solve(handle_(c_), 1, &solution[0], dim_), "solve");
+ }
+ 
+ void CHOLMODWrapper::solve(const CVector & rhs, CVector & solution){
+-    ASSERT_VEC_SIZE(rhs, this->dim_)
+-    ASSERT_VEC_SIZE(solution, this->dim_)
+-    if (!dummy_){
+-
+-        if (useUmfpack_){
+-#if USE_UMFPACK
+-            double * Ax_ = &((*AxV_)[0]);
+-            double * Az_ = &((*AzV_)[0]);
+-
+-            double *null = (double *) NULL ;
+-
+-            RVector xx(rhs.size());
+-            RVector xz(rhs.size());
+-            RVector bx(real(rhs));
+-            RVector bz(imag(rhs));
+-
+-            umfpack_zi_solve(UMFPACK_A, Ap_, Ai_, Ax_, Az_,
+-                             &xx[0], &xz[0], &bx[0], &bz[0],
+-                             Numeric_, null, null) ;
+-
+-            // fix crs->ccs sparseformat and cleanup/unify umfpackwrapper for this
+-
+-            // set booth to NULL or they will be wrongly deleted ..
+-
+-            solution = toComplex(xx, xz);
+-#endif
+-        } else {
+-            return solveCHOL_(rhs, solution);
+-        }
+-    }
++    throwError(WHERE_AM_I + " complex matrices are not supported by the "
++               "rustsolve backend of this pgcore build.");
+ }
+ 
+-
+ } //namespace GIMLI
+diff --git a/core/src/cholmodWrapper.h b/core/src/cholmodWrapper.h
+index b5ee78c..5514a0c 100644
+--- a/core/src/cholmodWrapper.h
++++ b/core/src/cholmodWrapper.h
+@@ -16,6 +16,12 @@
+  *                                                                            *
+  ******************************************************************************/
+ 
++/*
++ * Modified 2026 by Hang Chen for rustsolve
++ * (https://github.com/geohang/rustsolve): declares SolverWrapper's
++ * one-argument setMatrix overloads.
++ */
++
+ #ifndef _GIMLI_CHOLMODWRAPPER__H
+ #define _GIMLI_CHOLMODWRAPPER__H
+ 
+@@ -37,6 +43,10 @@ public:
+ 
+     virtual void setMatrix(CSparseMatrix & S);
+ 
++    /*! rustsolve: SolverWrapper's overloads, the same as the two above. */
++    virtual void setMatrix(const RSparseMatrix & S);
++    virtual void setMatrix(const CSparseMatrix & S);
++
+     virtual void solve(const RVector & rhs, RVector & solution);
+ 
+     virtual void solve(const CVector & rhs, CVector & solution);
+diff --git a/core/src/linSolver.cpp b/core/src/linSolver.cpp
+index bde4d32..bf3a0d2 100644
+--- a/core/src/linSolver.cpp
++++ b/core/src/linSolver.cpp
+@@ -16,6 +16,13 @@
+  *                                                                            *
+  ******************************************************************************/
+ 
++/*
++ * Modified 2026 by Hang Chen for rustsolve
++ * (https://github.com/geohang/rustsolve): a refused matrix leaves no solver
++ * behind, SolverWrapper's one-argument setMatrix overloads, SolverType LDL
++ * is refused.
++ */
++
+ #include "linSolver.h"
+ #include "sparsematrix.h"
+ #include "ldlWrapper.h"
+@@ -51,7 +58,14 @@ LinSolver::LinSolver(RSparseMapMatrix & S, bool verbose)
+     setSolverType(AUTOMATIC);
+     cacheMatrix_ = new RSparseMatrix(S);
+ 
+-    setMatrix(dynamic_cast < RSparseMatrix &>( *cacheMatrix_));
++    // rustsolve: a constructor that throws runs no destructor
++    try {
++        setMatrix(dynamic_cast < RSparseMatrix &>( *cacheMatrix_));
++    } catch (...) {
++        delete cacheMatrix_;
++        cacheMatrix_ = 0;
++        throw;
++    }
+ }
+ 
+ LinSolver::LinSolver(RSparseMatrix & S, SolverType solverType, bool verbose)
+@@ -115,13 +129,23 @@ void LinSolver::setMatrix(CSparseMatrix & S, int stype){
+     initialize_(S, stype);
+ }
+ 
++// rustsolve: SolverWrapper's overloads. The wrappers only read S.
++void LinSolver::setMatrix(const RSparseMatrix & S){
++    initialize_(const_cast< RSparseMatrix & >(S), -2);
++}
++
++void LinSolver::setMatrix(const CSparseMatrix & S){
++    initialize_(const_cast< CSparseMatrix & >(S), -2);
++}
++
+ void LinSolver::solve(const RVector & rhs, RVector & solution){
+     ASSERT_VEC_SIZE(rhs, cols_)
+     solution.resize(rows_);
+     if (rhs.size() != cols_){
+         std::cerr << WHERE_AM_I << " rhs size mismatch: " << cols_ << "  " << rhs.size() << std::endl;
+     }
+-    if (solver_) solver_->solve(rhs, solution);
++    if (!solver_) throwError(WHERE_AM_I + " no matrix set (rustsolve: or the last one was refused)");
++    solver_->solve(rhs, solution);
+ }
+ 
+ void LinSolver::solve(const CVector & rhs, CVector & solution){
+@@ -130,30 +154,40 @@ void LinSolver::solve(const CVector & rhs, CVector & solution){
+     if (rhs.size() != cols_){
+         std::cerr << WHERE_AM_I << " rhs size mismatch: " << cols_ << "  " << rhs.size() << std::endl;
+     }
+-    if (solver_) solver_->solve(rhs, solution);
++    if (!solver_) throwError(WHERE_AM_I + " no matrix set (rustsolve: or the last one was refused)");
++    solver_->solve(rhs, solution);
+ }
+ 
+ RVector LinSolver::solve(const RVector & rhs){
+     ASSERT_VEC_SIZE(rhs, cols_)
+     RVector solution(rhs.size());
+-    if (solver_) solver_->solve(rhs, solution);
++    if (!solver_) throwError(WHERE_AM_I + " no matrix set (rustsolve: or the last one was refused)");
++    solver_->solve(rhs, solution);
+     return solution;
+ }
+ 
+ CVector LinSolver::solve(const CVector & rhs){
+     ASSERT_VEC_SIZE(rhs, cols_)
+     CVector solution(rhs.size());
+-    if (solver_) solver_->solve(rhs, solution);
++    if (!solver_) throwError(WHERE_AM_I + " no matrix set (rustsolve: or the last one was refused)");
++    solver_->solve(rhs, solution);
+     return solution;
+ }
+ 
+ void LinSolver::initialize_(RSparseMatrix & S, int stype){
++    // rustsolve: drop the previous matrix's solver first, so a setMatrix that
++    // throws leaves none and solve() refuses instead of using the old matrix
++    if (solver_) {
++        delete solver_;
++        solver_ = 0;
++    }
+     rows_ = S.rows();
+     cols_ = S.cols();
+     setSolverType(solverType_);
+ 
+     switch(solverType_){
+-        case LDL:     solver_ = new LDLWrapper(S, verbose_); break;
++        // rustsolve: no LDL in this build; LDLWrapper would solve nothing
++        case LDL:     throwError(WHERE_AM_I + " SolverType LDL is not available in this build."); break;
+         case CHOLMOD: solver_ = new CHOLMODWrapper(S, verbose_, stype); break;
+         case UMFPACK: solver_ = new CHOLMODWrapper(S, verbose_, stype, true); break;
+         case UNKNOWN:
+@@ -163,12 +197,19 @@ void LinSolver::initialize_(RSparseMatrix & S, int stype){
+ }
+ 
+ void LinSolver::initialize_(CSparseMatrix & S, int stype){
++    // rustsolve: drop the previous matrix's solver first, so a setMatrix that
++    // throws leaves none and solve() refuses instead of using the old matrix
++    if (solver_) {
++        delete solver_;
++        solver_ = 0;
++    }
+     rows_ = S.rows();
+     cols_ = S.cols();
+     setSolverType(solverType_);
+ 
+     switch(solverType_){
+-        case LDL:     solver_ = new LDLWrapper(S, verbose_); break;
++        // rustsolve: no LDL in this build; LDLWrapper would solve nothing
++        case LDL:     throwError(WHERE_AM_I + " SolverType LDL is not available in this build."); break;
+         case CHOLMOD: solver_ = new CHOLMODWrapper(S, verbose_, stype); break;
+         case UMFPACK: solver_ = new CHOLMODWrapper(S, verbose_, stype, true); break;
+         case UNKNOWN:
+diff --git a/core/src/linSolver.h b/core/src/linSolver.h
+index 9cf6170..b3cabce 100644
+--- a/core/src/linSolver.h
++++ b/core/src/linSolver.h
+@@ -16,6 +16,12 @@
+  *                                                                            *
+  ******************************************************************************/
+ 
++/*
++ * Modified 2026 by Hang Chen for rustsolve
++ * (https://github.com/geohang/rustsolve): declares SolverWrapper's
++ * one-argument setMatrix overloads.
++ */
++
+ #ifndef _GIMLI_LINSOLVER__H
+ #define _GIMLI_LINSOLVER__H
+ 
+@@ -66,6 +72,10 @@ public:
+     /*! Verbose level = -1, use Linsolver.verbose(). */
+     void setMatrix(CSparseMatrix & S, int stype=-2);
+ 
++    /*! rustsolve: SolverWrapper's overloads, the same as setMatrix(S, -2). */
++    virtual void setMatrix(const RSparseMatrix & S);
++    virtual void setMatrix(const CSparseMatrix & S);
++
+     SolverType solverType() const { return solverType_; }
+ 
+     std::string solverName() const;

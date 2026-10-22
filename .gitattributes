@@ -1,0 +1,10 @@
+* text=auto
+# applied with git apply against LF sources: never convert
+*.patch -text
+*.rs text eol=lf
+*.py text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf

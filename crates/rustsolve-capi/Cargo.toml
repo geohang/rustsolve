@@ -1,0 +1,22 @@
+[package]
+name = "rustsolve-capi"
+description = "C ABI of rustsolve (include/rustsolve.h)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+# rustsolve_capi.dll / librustsolve_capi.dylib / librustsolve_capi.so
+name = "rustsolve_capi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+nd = ["rustsolve/nd"]
+
+[dependencies]
+rustsolve = { path = "../rustsolve" }

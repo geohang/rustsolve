@@ -1,0 +1,115 @@
+# Build libgimli for the gimli channel's macOS pgcore (osx-arm64) with
+# rustsolve in place of CHOLMOD/UMFPACK, and run the C++ check of the patched
+# LinSolver against it. Manual runs only.
+
+name: pgcore macOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    env:
+      PGCORE_SPEC: "pgcore=1.5.4=np22py311h3a9382f_0"
+      # v1.5.4; the package's versionStr() is v1.5.3-53-g6241cfab (built before the tag)
+      GIMLI_REF: v1.5.4
+      GIMLI_COMMIT: 6241cfab
+      GIMLI_VERSION: v1.5.3-53-g6241cfab
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: gimli-org/gimli
+          ref: ${{ env.GIMLI_REF }}
+          path: gimli
+
+      - name: Check the gimli commit
+        run: |
+          test "$(git -C gimli rev-parse --short=8 HEAD)" = "$GIMLI_COMMIT"
+
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          python-version: "3.11"
+          activate-environment: pg
+
+      - name: Runtime environment
+        run: |
+          conda install -y -c gimli -c conda-forge pygimli "$PGCORE_SPEC" "libblas=*=*openblas"
+          python -c "import pgcore, pygimli as pg; print(pg.core.versionStr(), pgcore.__file__, pg.__version__)"
+          echo "PG=$CONDA_PREFIX" >> "$GITHUB_ENV"
+          mkdir -p out
+          conda list --explicit --md5 > out/conda-explicit-runtime.txt
+
+      - name: Compiler environment
+        run: |
+          conda create -y -n tc -c conda-forge cxx-compiler c-compiler cmake make
+          conda list -n tc --explicit --md5 > out/conda-explicit-toolchain.txt
+
+      - name: rustsolve C ABI
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+          cargo build --locked --release -p rustsolve-capi --features nd
+          P=$PWD/rsprefix
+          mkdir -p "$P/include" "$P/lib"
+          cp crates/rustsolve-capi/include/rustsolve.h "$P/include/"
+          cp target/release/librustsolve_capi.dylib "$P/lib/"
+          install_name_tool -id @rpath/librustsolve_capi.dylib "$P/lib/librustsolve_capi.dylib"
+          codesign --force -s - "$P/lib/librustsolve_capi.dylib"
+          otool -L "$P/lib/librustsolve_capi.dylib"
+
+      - name: Patch gimli
+        run: python pgcore/apply_rustsolve.py gimli
+
+      - name: Build libgimli
+        run: |
+          # conda-forge's clang packages no longer set CC/CXX on activation:
+          # name the toolchain environment's compilers, and put the runtime
+          # environment's libraries (libc++) first on the link path
+          TC=$CONDA/envs/tc
+          export PATH="$TC/bin:$PATH"
+          if [ -x "$TC/bin/arm64-apple-darwin20.0.0-clang++" ]; then
+            export CC=$TC/bin/arm64-apple-darwin20.0.0-clang CXX=$TC/bin/arm64-apple-darwin20.0.0-clang++
+          else
+            export CC=$TC/bin/clang CXX=$TC/bin/clang++
+          fi
+          export LDFLAGS="-L$PG/lib -Wl,-headerpad_max_install_names"
+          export SDKROOT=$(xcrun --show-sdk-path)
+          echo "CC=$CC CXX=$CXX"; "$CXX" --version
+          bash pgcore/build-libgimli-macos.sh gimli rsprefix work "$GIMLI_VERSION" "$PG"
+          shasum -a 256 work/rebuilt/*.dylib | tee out/rebuilt-sha256.txt
+          set -o pipefail
+          bash pgcore/check/run-check-macos.sh gimli work rsprefix "$PG" | tee out/linsolver-check.txt
+
+      - name: Load the rebuilt core under the shipped bindings
+        run: |
+          DYLD_LIBRARY_PATH="$PWD/work/rebuilt" python -c "
+          import pygimli as pg
+          v = pg.core.versionStr()
+          print(v)
+          assert v.endswith('+rustsolve'), v
+          " | tee out/load.txt
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgcore-macos
+          path: |
+            out/
+            work/rebuilt/
+            work/build/configure.log
+            work/build/build.log
+          if-no-files-found: warn

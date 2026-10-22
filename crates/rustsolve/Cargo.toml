@@ -1,0 +1,21 @@
+[package]
+name = "rustsolve"
+description = "Sparse direct solves (LL^T, LDL^T, LU) for finite-element systems, on faer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# multilevel nested-dissection ordering (feral-metis, pure Rust, MIT); off by
+# default while the ordering policy for 3D is open (docs/design.md)
+nd = ["dep:feral-metis"]
+
+[dependencies]
+faer.workspace = true
+rayon.workspace = true
+feral-metis = { workspace = true, optional = true }

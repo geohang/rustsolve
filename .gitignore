@@ -1,0 +1,12 @@
+/target/
+__pycache__/
+*.pyc
+*.f64
+*.i64
+/bench/results/
+/bench/cases/
+*.pyd
+*.so
+/dist/
+*.egg-info/
+/bench-data/
