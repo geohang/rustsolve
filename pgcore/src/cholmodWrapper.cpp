@@ -27,7 +27,7 @@
  * Behaviour kept from the original:
  *  - real symmetric matrices: Cholesky (was CHOLMOD), from one triangle;
  *    a matrix stored as one triangle (S.stype() != 0) is read from that
- *    triangle, the other entries ignored, as CHOLMOD did;
+ *    triangle, the other entries ignored;
  *  - the symmetry test (absolute 1e-12); a full-storage matrix that fails
  *    it, or forceUmfpack / BERTUSEUMFPACK=1: LU (was UMFPACK).
  * Behaviour changed on purpose:
@@ -121,7 +121,7 @@ void transpose_(Index n, const std::vector < int > & cp,
 /*! Full symmetric storage, as compressed rows, of a matrix stored as one
  * triangle: stype < 0 keeps columns j >= i of each row i, stype > 0 keeps
  * j <= i (pgcore's SparseMapMatrix convention); entries of the other triangle
- * are ignored, as CHOLMOD ignored them. */
+ * are ignored. */
 void fullFromTriangle_(Index n, int stype, const std::vector < int > & cp,
                        const std::vector < int > & ri, const RVector & v,
                        std::vector < int > & fp, std::vector < int > & fi,
@@ -291,7 +291,7 @@ int CHOLMODWrapper::initializeMatrix_(RSparseMatrix & S){
             // symmetry is decided above with the original's test (absolute 1e-12),
             // and a matrix that fails it goes to LU. rustsolve's own test is
             // relative and would refuse matrices the original factorized: the
-            // Cholesky reads one triangle, as CHOLMOD did.
+            // Cholesky reads one triangle.
             o.check_symmetry = 0;
             // for experiments; the thread and ordering policy is an open
             // question (docs/design.md)

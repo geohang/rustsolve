@@ -34,7 +34,7 @@ Apache-2.0.
   each changed file gets a modification notice.
 - `pgcore/build-libgimli-msys2.sh` and `pgcore/build-libgimli-macos.sh`
   download Triangle (Jonathan R. Shewchuk) from netlib and link it into
-  libgimli, as pyGIMLi's own build does. Triangle is not part of this
+  libgimli, which uses it for 2D meshes. Triangle is not part of this
   repository and has its own licence: it may be distributed freely for
   non-commercial use, and distributing it as part of a commercial product
   needs its author's permission.

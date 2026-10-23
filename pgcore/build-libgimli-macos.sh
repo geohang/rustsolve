@@ -25,8 +25,8 @@ SDK=$(xcrun --show-sdk-path)
 : "${CXX:?activate a conda-forge compiler environment (CXX unset)}"
 PY=$RT/bin/python
 
-# Triangle (Shewchuk), statically into libgimli; gimli's own script drops
-# -DLINUX on macOS and builds the trilibrary target
+# Triangle (Shewchuk), linked statically into libgimli: the trilibrary
+# target, without -DLINUX on macOS
 TRI_URL=https://www.netlib.org/voronoi/triangle.zip
 TRI_SHA256=1766327add038495fa3499e9b7cc642179229750f7201b94f8e1b7bee76f8480
 if [ ! -f "$WORK/tri/lib/libtriangle.a" ]; then

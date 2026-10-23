@@ -14,7 +14,7 @@ set -euo pipefail
 GIMLI=$(cd "$1" && pwd); PREFIX=$(cd "$2" && pwd); WORK=$3; VERSION=$4; PY=$5
 mkdir -p "$WORK"; WORK=$(cd "$WORK" && pwd)
 
-# Triangle (Shewchuk), statically into libgimli as gimli's own build does
+# Triangle (Shewchuk), linked statically into libgimli
 TRI_URL=https://www.netlib.org/voronoi/triangle.zip
 TRI_SHA256=1766327add038495fa3499e9b7cc642179229750f7201b94f8e1b7bee76f8480
 if [ ! -f "$WORK/tri/lib/libtriangle.a" ]; then

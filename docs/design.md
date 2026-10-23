@@ -145,12 +145,12 @@ REQUIRED)`. See [pgcore/README.md](../pgcore/README.md).
 Symmetry is decided once, in the wrapper, with the original's test: an
 absolute difference of 1e-12 between the two stored triangles. A matrix that
 fails it goes to LU. A matrix that passes is factorized from one triangle,
-with `check_symmetry` off, as CHOLMOD did. rustsolve's own test is relative
+with `check_symmetry` off, so pgcore's behaviour is unchanged. rustsolve's own test is relative
 (1e-12): left on, it refused small-valued matrices that the original
 factorized, such as entries of 1e-5 that differ by 5e-13.
 
 A matrix stored as one triangle (`S.stype()` ≠ 0) is read from that
-triangle, as CHOLMOD read it. pgcore's stype −1 keeps columns j ≥ i of each
+triangle. pgcore's stype −1 keeps columns j ≥ i of each
 row, which is the triangle rustsolve reads from compressed rows; stype 1 is
 handed over transposed. LU (UMFPACK's place) builds the full symmetric matrix
 from the triangle; UMFPACK factorized the triangle alone.
@@ -206,14 +206,13 @@ accepted is the last of the open questions below.
 ## Open questions
 
 1. Non-symmetric matrices that reach the automatic path. Provisional choice:
-   explicit LU with a log message, as pgcore switched to UMFPACK. The
+   explicit LU with a log message, which keeps pgcore's behaviour. The
    alternative is to refuse them. ERT matrices are exactly symmetric.
 2. Ordering for 3D. With AMD only, faer's 3D fill is twice CHOLMOD's; nested
    dissection brings it to parity. Options:
    - (a) feral-metis 0.3.0: pure Rust, MIT; young, one author;
    - (b) a geometric nested dissection on the mesh's node coordinates;
-   - (c) AMD first, nested dissection when the fill is large, as CHOLMOD
-     does.
+   - (c) AMD first, nested dissection when the fill is large.
 
    The `nd` feature is off by default until this is decided.
 3. Thread policy. Proposal: sequential solves; factorization threads chosen
